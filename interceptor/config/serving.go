@@ -53,6 +53,10 @@ type Serving struct {
 	EnableColdStartHeader bool `env:"KEDA_HTTP_ENABLE_COLD_START_HEADER" envDefault:"true"`
 	// LogRequests enables/disables logging of incoming requests
 	LogRequests bool `env:"KEDA_HTTP_LOG_REQUESTS" envDefault:"false"`
+	// DirectPodOnColdStart routes requests directly to a ready pod IP (instead of
+	// the ClusterIP service) when a cold start is detected. Use this when the
+	// service mesh sidecar may not be ready at pod startup time.
+	DirectPodOnColdStart bool `env:"KEDA_HTTP_DIRECT_POD_ON_COLD_START" envDefault:"false"`
 }
 
 // MustParseServing parses standard configs and returns the

@@ -3,7 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
-	"slices"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 
@@ -14,14 +14,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// ReadyEndpointsCache maintains a derived map of service -> ready (bool)
+// serviceState is an immutable snapshot of a service's ready pod IPs.
+// Replaced atomically on every EndpointSlice event; readers hold a pointer
+// to the old snapshot safely without locks.
+type serviceState struct {
+	ready    bool             // len(readyIPs) > 0
+	readyIPs []string         // K8s-ready pod IPs (deduplicated)
+	ports    map[string]int32 // portName → containerPort from EndpointSlice
+}
+
+func (s *serviceState) hasReady() bool { return s != nil && s.ready }
+
+// ReadyEndpointsCache maintains a derived map of service -> serviceState
 // for O(1) hot-path lookups, plus a broadcast mechanism so the cold-start
 // wait function can block until a service becomes ready.
 type ReadyEndpointsCache struct {
 	lggr logr.Logger
 
-	// "namespace/service" -> *atomic.Bool
-	ready sync.Map
+	// "namespace/service" -> *atomic.Pointer[serviceState]
+	states sync.Map
 
 	// Broadcast mechanism: the channel is closed on any change,
 	// then replaced with a fresh one. Waiters select on the channel.
@@ -40,8 +51,8 @@ func NewReadyEndpointsCache(lggr logr.Logger) *ReadyEndpointsCache {
 // HasReadyEndpoints returns true if the service has at least one ready endpoint.
 // This is the fast hot-path check (one atomic load).
 func (c *ReadyEndpointsCache) HasReadyEndpoints(serviceKey string) bool {
-	if v, ok := c.ready.Load(serviceKey); ok {
-		return v.(*atomic.Bool).Load()
+	if v, ok := c.states.Load(serviceKey); ok {
+		return v.(*atomic.Pointer[serviceState]).Load().hasReady()
 	}
 	return false
 }
@@ -98,21 +109,48 @@ func (c *ReadyEndpointsCache) WaitForReady(ctx context.Context, serviceKey strin
 	}
 }
 
-// Update checks whether the given service has at least one ready,
-// non-terminating endpoint and stores the result. Short-circuits on
-// the first ready endpoint found. If no slices remain for the service,
-// the key is removed to avoid unbounded map growth.
+// PickReadyEndpoint returns a randomly selected ready pod IP and its container
+// port for the given portName. portName must match the EndpointSlice port name
+// (which equals the Service port name). Returns ok=false when no ready pod IPs
+// are known for the service or the portName is not found in the port map.
+func (c *ReadyEndpointsCache) PickReadyEndpoint(serviceKey, portName string) (ip string, port int32, ok bool) {
+	v, exists := c.states.Load(serviceKey)
+	if !exists {
+		return "", 0, false
+	}
+	state := v.(*atomic.Pointer[serviceState]).Load()
+	if !state.hasReady() {
+		return "", 0, false
+	}
+	port, ok = state.ports[portName]
+	if !ok {
+		return "", 0, false
+	}
+	return state.readyIPs[rand.Intn(len(state.readyIPs))], port, true
+}
+
+// Update checks the given EndpointSlices, builds a new serviceState snapshot,
+// and atomically replaces the old one.
 func (c *ReadyEndpointsCache) Update(serviceKey string, endpointSlices []*discov1.EndpointSlice) {
 	if len(endpointSlices) == 0 {
-		c.ready.Delete(serviceKey)
+		c.states.Delete(serviceKey)
 		c.broadcast()
 		return
 	}
 
-	hasReady := slices.ContainsFunc(endpointSlices, hasAnyReadyEndpoint)
+	newState := collectServiceState(endpointSlices)
 
-	v, _ := c.ready.LoadOrStore(serviceKey, &atomic.Bool{})
-	if old := v.(*atomic.Bool).Swap(hasReady); old != hasReady {
+	ptr := &atomic.Pointer[serviceState]{}
+	ptr.Store(newState)
+	actual, loaded := c.states.LoadOrStore(serviceKey, ptr)
+
+	if loaded {
+		oldState := actual.(*atomic.Pointer[serviceState]).Load()
+		actual.(*atomic.Pointer[serviceState]).Store(newState)
+		if oldState.hasReady() != newState.hasReady() {
+			c.broadcast()
+		}
+	} else if newState.hasReady() {
 		c.broadcast()
 	}
 }
@@ -127,19 +165,43 @@ func (c *ReadyEndpointsCache) broadcast() {
 	close(old)
 }
 
-// hasAnyReadyEndpoint returns true if the slice contains at least one
-// ready endpoint with at least one address.
-// Kubernetes guarantees that Ready is false for terminating pods, so a
-// separate Terminating check is unnecessary. For services with
-// publishNotReadyAddresses, Ready is always true — we respect that.
-func hasAnyReadyEndpoint(slice *discov1.EndpointSlice) bool {
-	for i := range slice.Endpoints {
-		ep := &slice.Endpoints[i]
-		if (ep.Conditions.Ready == nil || *ep.Conditions.Ready) && len(ep.Addresses) > 0 {
-			return true
+// collectServiceState extracts ready pod IPs and the container port map from a
+// set of EndpointSlices into an immutable serviceState snapshot.
+// ports maps portName → containerPort; the port name matches Service.spec.ports[i].name.
+// Unnamed ports (Name == nil) are stored under the empty string key.
+func collectServiceState(slices []*discov1.EndpointSlice) *serviceState {
+	seen := make(map[string]struct{})
+	ports := make(map[string]int32)
+	for _, sl := range slices {
+		for _, p := range sl.Ports {
+			if p.Port == nil {
+				continue
+			}
+			name := ""
+			if p.Name != nil {
+				name = *p.Name
+			}
+			if _, exists := ports[name]; !exists {
+				ports[name] = *p.Port
+			}
+		}
+		for i := range sl.Endpoints {
+			ep := &sl.Endpoints[i]
+			// Kubernetes guarantees that Ready is false for terminating pods, so a
+			// separate Terminating check is unnecessary. For services with
+			// publishNotReadyAddresses, Ready is always true — we respect that.
+			if (ep.Conditions.Ready == nil || *ep.Conditions.Ready) && len(ep.Addresses) > 0 {
+				for _, addr := range ep.Addresses {
+					seen[addr] = struct{}{}
+				}
+			}
 		}
 	}
-	return false
+	ips := make([]string, 0, len(seen))
+	for ip := range seen {
+		ips = append(ips, ip)
+	}
+	return &serviceState{ready: len(ips) > 0, readyIPs: ips, ports: ports}
 }
 
 // updateReadyCache updates the ready cache for the service that owns
