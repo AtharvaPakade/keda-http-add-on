@@ -424,3 +424,245 @@ func addReadyEndpoint(cache *k8s.ReadyEndpointsCache) {
 		{Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}}},
 	})
 }
+
+func addReadyEndpointWithPort(cache *k8s.ReadyEndpointsCache, port int32) {
+	cache.Update(testNamespace+"/"+testService, []*discov1.EndpointSlice{
+		{
+			Ports:     []discov1.EndpointPort{{Port: &port}},
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+		},
+	})
+}
+
+func addReadyEndpointWithNamedPorts(cache *k8s.ReadyEndpointsCache, ports []discov1.EndpointPort) {
+	cache.Update(testNamespace+"/"+testService, []*discov1.EndpointSlice{
+		{
+			Ports:     ports,
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+		},
+	})
+}
+
+// TestEndpointResolver_DirectPodOnColdStart_UsedOnColdStart verifies that when
+// DirectPodOnColdStart=true and the backend undergoes a cold start, the upstream
+// URL is rewritten to the pod IP:containerPort.
+func TestEndpointResolver_DirectPodOnColdStart_UsedOnColdStart(t *testing.T) {
+	cache := k8s.NewReadyEndpointsCache(logr.Discard())
+	// Start with no ready endpoints to force a cold start.
+
+	var capturedUpstream *url.URL
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedUpstream = util.UpstreamURLFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mw := NewEndpointResolver(next, cache, EndpointResolverConfig{
+		ReadinessTimeout:     2 * time.Second,
+		DirectPodOnColdStart: true,
+	})
+
+	rec := httptest.NewRecorder()
+	req := newRequest(t, defaultIR())
+
+	// Add endpoint with a known container port after the middleware starts waiting.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		addReadyEndpointWithPort(cache, 8080)
+	}()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if capturedUpstream == nil {
+		t.Fatal("upstream URL should not be nil")
+	}
+	if capturedUpstream.Host != "1.2.3.4:8080" {
+		t.Fatalf("upstream host = %q, want %q", capturedUpstream.Host, "1.2.3.4:8080")
+	}
+}
+
+// TestEndpointResolver_DirectPodOnColdStart_MultiPort verifies that when the pod
+// exposes multiple ports (e.g. metrics first, server second), direct-pod routing
+// picks the container port that matches the InterceptorRoute's PortName — not
+// whatever happens to be first in the EndpointSlice.
+func TestEndpointResolver_DirectPodOnColdStart_MultiPort(t *testing.T) {
+	cache := k8s.NewReadyEndpointsCache(logr.Discard())
+
+	metricsName := "metrics"
+	metricsPort := int32(9090)
+	httpName := "http"
+	httpPort := int32(8080)
+
+	var capturedUpstream *url.URL
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedUpstream = util.UpstreamURLFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	ir := defaultIR()
+	ir.Spec.Target.PortName = "http"
+
+	mw := NewEndpointResolver(next, cache, EndpointResolverConfig{
+		ReadinessTimeout:     2 * time.Second,
+		DirectPodOnColdStart: true,
+	})
+
+	rec := httptest.NewRecorder()
+	req := newRequest(t, ir)
+
+	// metrics port is listed first; server port (http) is second.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		addReadyEndpointWithNamedPorts(cache, []discov1.EndpointPort{
+			{Name: &metricsName, Port: &metricsPort},
+			{Name: &httpName, Port: &httpPort},
+		})
+	}()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if capturedUpstream == nil {
+		t.Fatal("upstream URL should not be nil")
+	}
+	if capturedUpstream.Host != "1.2.3.4:8080" {
+		t.Fatalf("upstream host = %q, want %q — should route to http port, not metrics port",
+			capturedUpstream.Host, "1.2.3.4:8080")
+	}
+}
+
+// TestEndpointResolver_DirectPodOnColdStart_EmptyPortName verifies that when the
+// InterceptorRoute uses a numeric Port (PortName="") and the pod has only named
+// ports, direct-pod routing is skipped and the ClusterIP URL is left unchanged.
+func TestEndpointResolver_DirectPodOnColdStart_EmptyPortName(t *testing.T) {
+	cache := k8s.NewReadyEndpointsCache(logr.Discard())
+
+	httpName := "http"
+	httpPort := int32(8080)
+
+	var capturedUpstream *url.URL
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedUpstream = util.UpstreamURLFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// IR uses numeric Port — PortName is empty.
+	ir := defaultIR()
+	ir.Spec.Target.PortName = ""
+
+	mw := NewEndpointResolver(next, cache, EndpointResolverConfig{
+		ReadinessTimeout:     2 * time.Second,
+		DirectPodOnColdStart: true,
+	})
+
+	rec := httptest.NewRecorder()
+	req := newRequest(t, ir)
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		addReadyEndpointWithNamedPorts(cache, []discov1.EndpointPort{
+			{Name: &httpName, Port: &httpPort},
+		})
+	}()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if capturedUpstream == nil {
+		t.Fatal("upstream URL should not be nil")
+	}
+	// PortName="" with only named ports → PickReadyEndpoint returns ok=false →
+	// ClusterIP URL must be left unchanged.
+	if capturedUpstream.Host != "upstream" {
+		t.Fatalf("upstream host = %q, want %q — should not rewrite when PortName is empty",
+			capturedUpstream.Host, "upstream")
+	}
+}
+
+// TestEndpointResolver_DirectPodOnColdStart_UnnamedPort verifies that when the
+// InterceptorRoute uses a numeric Port (PortName="") and the EndpointSlice port
+// is also unnamed (Name==nil), direct-pod routing succeeds because both sides use
+// the "" key.
+func TestEndpointResolver_DirectPodOnColdStart_UnnamedPort(t *testing.T) {
+	cache := k8s.NewReadyEndpointsCache(logr.Discard())
+
+	var capturedUpstream *url.URL
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedUpstream = util.UpstreamURLFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// IR uses numeric Port — PortName is empty.
+	ir := defaultIR()
+	ir.Spec.Target.PortName = ""
+
+	mw := NewEndpointResolver(next, cache, EndpointResolverConfig{
+		ReadinessTimeout:     2 * time.Second,
+		DirectPodOnColdStart: true,
+	})
+
+	rec := httptest.NewRecorder()
+	req := newRequest(t, ir)
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		// Port with Name==nil → stored under "" in the ports map.
+		addReadyEndpointWithPort(cache, 8080)
+	}()
+
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if capturedUpstream == nil {
+		t.Fatal("upstream URL should not be nil")
+	}
+	// PortName="" with unnamed EndpointSlice port → lookup succeeds → URL rewritten.
+	if capturedUpstream.Host != "1.2.3.4:8080" {
+		t.Fatalf("upstream host = %q, want %q — unnamed port should match empty PortName",
+			capturedUpstream.Host, "1.2.3.4:8080")
+	}
+}
+
+// TestEndpointResolver_DirectPodOnColdStart_NotUsedOnWarmPath verifies that when
+// DirectPodOnColdStart=true but the backend is already warm (isColdStart=false),
+// the upstream URL is NOT rewritten to the pod IP.
+func TestEndpointResolver_DirectPodOnColdStart_NotUsedOnWarmPath(t *testing.T) {
+	cache := k8s.NewReadyEndpointsCache(logr.Discard())
+	// Pre-populate so WaitForReady returns immediately with isColdStart=false.
+	addReadyEndpointWithPort(cache, 8080)
+
+	var capturedUpstream *url.URL
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedUpstream = util.UpstreamURLFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mw := NewEndpointResolver(next, cache, EndpointResolverConfig{
+		ReadinessTimeout:     2 * time.Second,
+		DirectPodOnColdStart: true,
+	})
+
+	rec := httptest.NewRecorder()
+	req := newRequest(t, defaultIR())
+	// upstream URL is set to "upstream" in newRequest
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if capturedUpstream == nil {
+		t.Fatal("upstream URL should not be nil")
+	}
+	// Must still be the original service URL, not the pod IP
+	if capturedUpstream.Host != "upstream" {
+		t.Fatalf("upstream host = %q, want %q (should not be rewritten on warm path)", capturedUpstream.Host, "upstream")
+	}
+}

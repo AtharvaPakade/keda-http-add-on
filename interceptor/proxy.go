@@ -51,7 +51,7 @@ func BuildProxyHandler(cfg *ProxyHandlerConfig) http.Handler {
 	}
 
 	var forwardingTLSCfg *tls.Config
-	if cfg.TLSConfig != nil {
+	if cfg.TLSConfig != nil && !cfg.Serving.TLSUpstreamDisabled {
 		forwardingTLSCfg = &tls.Config{
 			RootCAs:            cfg.TLSConfig.RootCAs,
 			Certificates:       cfg.TLSConfig.Certificates,
@@ -79,6 +79,7 @@ func BuildProxyHandler(cfg *ProxyHandlerConfig) http.Handler {
 	h = middleware.NewEndpointResolver(h, cfg.ReadyCache, middleware.EndpointResolverConfig{
 		ReadinessTimeout:      cfg.Timeouts.Readiness,
 		EnableColdStartHeader: cfg.Serving.EnableColdStartHeader,
+		DirectPodOnColdStart:  cfg.Serving.DirectPodOnColdStart,
 	})
 
 	h = middleware.NewCounting(h, cfg.Queue, cfg.Instruments)
@@ -87,7 +88,7 @@ func BuildProxyHandler(cfg *ProxyHandlerConfig) http.Handler {
 		h,
 		cfg.RoutingTable,
 		cfg.Reader,
-		cfg.TLSConfig != nil,
+		cfg.TLSConfig != nil && !cfg.Serving.TLSUpstreamDisabled,
 		cfg.Timeouts.Request,
 	)
 

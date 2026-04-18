@@ -17,6 +17,11 @@ import (
 	"github.com/kedacore/http-add-on/pkg/util"
 )
 
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
 type Routing struct {
 	routingTable   routing.Table
 	next           http.Handler
@@ -121,9 +126,9 @@ func (rm *Routing) resolveUpstreamURL(ctx context.Context, target httpv1beta.Tar
 		return nil, fmt.Errorf("failed to get port: %w", err)
 	}
 
-	scheme := "http"
+	scheme := schemeHTTP
 	if rm.tlsEnabled {
-		scheme = "https"
+		scheme = schemeHTTPS
 	}
 
 	return &url.URL{

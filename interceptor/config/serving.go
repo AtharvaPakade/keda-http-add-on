@@ -47,12 +47,20 @@ type Serving struct {
 	// TLSCurvePreferences is a comma-separated list of elliptic curve names
 	// (e.g. "X25519,CurveP256"). If empty, the default Go curve preferences are used.
 	TLSCurvePreferences string `env:"KEDA_HTTP_PROXY_TLS_CURVE_PREFERENCES" envDefault:""`
+	// TLSUpstreamDisabled disables TLS for upstream connections even when the proxy server
+	// itself has TLS enabled. When true, requests are forwarded to upstream pods over plain
+	// HTTP regardless of the proxy TLS setting.
+	TLSUpstreamDisabled bool `env:"KEDA_HTTP_PROXY_TLS_UPSTREAM_DISABLED" envDefault:"false"`
 	// ProfilingAddr if not empty, pprof will be available on this address, assuming host:port here
 	ProfilingAddr string `env:"PROFILING_BIND_ADDRESS" envDefault:""`
 	// EnableColdStartHeader enables/disables the X-KEDA-HTTP-Cold-Start response header
 	EnableColdStartHeader bool `env:"KEDA_HTTP_ENABLE_COLD_START_HEADER" envDefault:"true"`
 	// LogRequests enables/disables logging of incoming requests
 	LogRequests bool `env:"KEDA_HTTP_LOG_REQUESTS" envDefault:"false"`
+	// DirectPodOnColdStart routes requests directly to a ready pod IP (instead of
+	// the ClusterIP service) when a cold start is detected. Use this to reduce
+	// cold start latency when iptables-min-sync-period is high and ClusterIP/kube-proxy rules are slow to propagate.
+	DirectPodOnColdStart bool `env:"KEDA_HTTP_DIRECT_POD_ON_COLD_START" envDefault:"false"`
 }
 
 // MustParseServing parses standard configs and returns the

@@ -270,6 +270,27 @@ func TestProxyHandler_TLSBackend(t *testing.T) {
 	}
 }
 
+func TestProxyHandler_TLSUpstreamDisabled(t *testing.T) {
+	var receivedTLS bool
+	h := newProxyTestHarness(t, harnessConfig{
+		tlsUpstreamDisabled: true,
+		backendHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedTLS = r.TLS != nil
+			w.WriteHeader(http.StatusOK)
+		}),
+	})
+
+	resp := h.doRequest(t, http.MethodGet, "/api/resource", testHost)
+	defer resp.Body.Close()
+
+	if receivedTLS {
+		t.Error("expected backend to receive request over plain HTTP, not TLS")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
 // proxyTestHarness provides a configured proxy handler for testing.
 type proxyTestHarness struct {
 	Handler    http.Handler
@@ -283,6 +304,7 @@ type harnessConfig struct {
 	enableColdStartHeader bool
 	simulateColdStart     bool
 	tlsEnabled            bool
+	tlsUpstreamDisabled   bool
 	tracingEnabled        bool
 	useBlockingQueue      bool
 }
@@ -360,8 +382,8 @@ func newProxyTestHarness(t *testing.T, cfg harnessConfig) *proxyTestHarness {
 
 	// Build handler using production function
 	var tlsCfg *tls.Config
-	if cfg.tlsEnabled {
-		tlsCfg = &tls.Config{InsecureSkipVerify: true}
+	if cfg.tlsEnabled || cfg.tlsUpstreamDisabled {
+		tlsCfg = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 	handler := BuildProxyHandler(&ProxyHandlerConfig{
 		Logger:       logr.Discard(),
@@ -375,7 +397,10 @@ func newProxyTestHarness(t *testing.T, cfg harnessConfig) *proxyTestHarness {
 			Request:        60 * time.Second,
 			ResponseHeader: 5 * time.Second,
 		},
-		Serving:             config.Serving{EnableColdStartHeader: cfg.enableColdStartHeader},
+		Serving: config.Serving{
+			EnableColdStartHeader: cfg.enableColdStartHeader,
+			TLSUpstreamDisabled:   cfg.tlsUpstreamDisabled,
+		},
 		TLSConfig:           tlsCfg,
 		Tracing:             config.Tracing{Enabled: cfg.tracingEnabled},
 		Instruments:         metrics.NewNoopInstruments(),

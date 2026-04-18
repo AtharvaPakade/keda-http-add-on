@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -18,6 +19,7 @@ const defaultFallbackReadinessTimeout = 30 * time.Second
 type EndpointResolverConfig struct {
 	ReadinessTimeout      time.Duration
 	EnableColdStartHeader bool
+	DirectPodOnColdStart  bool // route to pod IP directly during cold start
 }
 
 type EndpointResolver struct {
@@ -96,6 +98,23 @@ func (er *EndpointResolver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// isColdStart is only meaningful when the backend resolved without errors
 	if err == nil && er.cfg.EnableColdStartHeader {
 		w.Header().Set(kedahttp.HeaderColdStart, strconv.FormatBool(isColdStart))
+	}
+
+	// Direct-to-pod routing: only during cold start, rewrite the upstream URL
+	// to a pod IP so the request bypasses the ClusterIP service. This is useful
+	// when the `iptables-min-sync-period` is high.
+	// Only safe for plain HTTP — rewriting to a pod IP with an https scheme causes
+	// Go's Transport to use the IP for SNI, breaking TLS validation.
+	if isColdStart && er.cfg.DirectPodOnColdStart {
+		if podIP, podPort, ok := er.readyCache.PickReadyEndpoint(serviceKey, ir.Spec.Target.PortName); ok {
+			if upstreamURL := util.UpstreamURLFromContext(ctx); upstreamURL != nil && upstreamURL.Scheme != schemeHTTPS {
+				podURL := *upstreamURL
+				podURL.Host = net.JoinHostPort(podIP, strconv.Itoa(int(podPort)))
+				ctx = util.ContextWithUpstreamURL(ctx, &podURL)
+				r = r.WithContext(ctx)
+			}
+		}
+		// ok=false (ambiguous multi-port or unknown portName) → ClusterIP URL unchanged
 	}
 
 	er.next.ServeHTTP(w, r)

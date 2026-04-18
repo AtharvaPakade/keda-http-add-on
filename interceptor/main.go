@@ -71,6 +71,13 @@ func main() {
 	proxyTLSEnabled := servingCfg.ProxyTLSEnabled
 	profilingAddr := servingCfg.ProfilingAddr
 
+	if servingCfg.DirectPodOnColdStart && proxyTLSEnabled && !servingCfg.TLSUpstreamDisabled {
+		setupLog.Error(nil,
+			"invalid configuration: KEDA_HTTP_DIRECT_POD_ON_COLD_START requires KEDA_HTTP_PROXY_TLS_UPSTREAM_DISABLED=true "+
+				"when TLS is enabled; rewriting the upstream URL to a pod IP with an https scheme would cause TLS SNI failures")
+		runtime.Goexit()
+	}
+
 	provider, err := metrics.NewMeterProvider(metricsCfg)
 	if err != nil {
 		setupLog.Error(err, "failed to create meter provider")

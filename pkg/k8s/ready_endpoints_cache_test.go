@@ -110,7 +110,277 @@ func TestWaitForReady_ContextCancelled(t *testing.T) {
 	r.ErrorIs(err, context.Canceled)
 }
 
-// --- Update / key retention tests ---
+// --- PickReadyEndpoint tests ---
+
+func TestPickReadyEndpoint_ReturnsReadyIPAndPort(t *testing.T) {
+	r := require.New(t)
+	c := NewReadyEndpointsCache(logr.Discard())
+	const key = "testns/testsvc"
+
+	port := int32(8080)
+	c.Update(key, []*discov1.EndpointSlice{
+		{
+			Ports:     []discov1.EndpointPort{{Port: &port}},
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+		},
+	})
+
+	// unnamed port (Name==nil) is stored under the "" key
+	ip, gotPort, ok := c.PickReadyEndpoint(key, "")
+	r.True(ok)
+	r.Equal("1.2.3.4", ip)
+	r.Equal(int32(8080), gotPort)
+}
+
+func TestPickReadyEndpoint_EmptyCache(t *testing.T) {
+	r := require.New(t)
+	c := NewReadyEndpointsCache(logr.Discard())
+
+	_, _, ok := c.PickReadyEndpoint("testns/testsvc", "")
+	r.False(ok, "should return false for unknown service")
+}
+
+func TestPickReadyEndpoint_ReturnsIPFromSet(t *testing.T) {
+	r := require.New(t)
+	c := NewReadyEndpointsCache(logr.Discard())
+	const key = "testns/testsvc"
+
+	port := int32(8080)
+	c.Update(key, []*discov1.EndpointSlice{
+		{
+			Ports: []discov1.EndpointPort{{Port: &port}},
+			Endpoints: []discov1.Endpoint{
+				{Addresses: []string{"1.2.3.4"}},
+				{Addresses: []string{"5.6.7.8"}},
+				{Addresses: []string{"9.10.11.12"}},
+			},
+		},
+	})
+
+	seen := make(map[string]bool)
+	for range 50 {
+		ip, _, ok := c.PickReadyEndpoint(key, "")
+		r.True(ok)
+		seen[ip] = true
+	}
+	for ip := range seen {
+		r.Contains([]string{"1.2.3.4", "5.6.7.8", "9.10.11.12"}, ip)
+	}
+}
+
+func TestPickReadyEndpoint_PortResolution(t *testing.T) {
+	httpPort := int32(8080)
+	metricsPort := int32(9090)
+	httpName := "http"
+	metricsName := "metrics"
+
+	slice := &discov1.EndpointSlice{
+		Ports: []discov1.EndpointPort{
+			{Name: &httpName, Port: &httpPort},
+			{Name: &metricsName, Port: &metricsPort},
+		},
+		Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+	}
+
+	tests := map[string]struct {
+		portName string
+		wantPort int32
+		wantOK   bool
+	}{
+		"named port present": {
+			portName: "http",
+			wantPort: 8080,
+			wantOK:   true,
+		},
+		"named port absent": {
+			portName: "admin",
+			wantOK:   false,
+		},
+		"empty portName with only named ports": {
+			portName: "",
+			wantOK:   false,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			r := require.New(t)
+			c := NewReadyEndpointsCache(logr.Discard())
+			c.Update("testns/testsvc", []*discov1.EndpointSlice{slice})
+
+			_, gotPort, ok := c.PickReadyEndpoint("testns/testsvc", tc.portName)
+			r.Equal(tc.wantOK, ok)
+			if tc.wantOK {
+				r.Equal(tc.wantPort, gotPort)
+			}
+		})
+	}
+}
+
+func TestPickReadyEndpoint_UnnamedPortWithEmptyPortName(t *testing.T) {
+	r := require.New(t)
+	c := NewReadyEndpointsCache(logr.Discard())
+
+	port := int32(8080)
+	c.Update("testns/testsvc", []*discov1.EndpointSlice{
+		{
+			Ports:     []discov1.EndpointPort{{Port: &port}}, // Name is nil → stored as ""
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+		},
+	})
+
+	_, gotPort, ok := c.PickReadyEndpoint("testns/testsvc", "")
+	r.True(ok)
+	r.Equal(int32(8080), gotPort)
+}
+
+// --- collectServiceState tests ---
+
+func TestCollectServiceState_ReadyEndpoints(t *testing.T) {
+	r := require.New(t)
+	port := int32(8080)
+	slice := &discov1.EndpointSlice{
+		Ports: []discov1.EndpointPort{{Port: &port}},
+		Endpoints: []discov1.Endpoint{
+			{Addresses: []string{"1.2.3.4"}},
+			{Addresses: []string{"5.6.7.8"}},
+		},
+	}
+	s := collectServiceState([]*discov1.EndpointSlice{slice})
+	r.True(s.ready)
+	got := make([]string, 0, len(s.candidates[""]))
+	for _, ep := range s.candidates[""] {
+		got = append(got, ep.ip)
+		r.Equal(int32(8080), ep.port)
+	}
+	r.ElementsMatch([]string{"1.2.3.4", "5.6.7.8"}, got)
+}
+
+func TestCollectServiceState_NotReadyEndpoints(t *testing.T) {
+	r := require.New(t)
+	notReady := false
+	slice := &discov1.EndpointSlice{
+		Endpoints: []discov1.Endpoint{
+			{
+				Addresses:  []string{"1.2.3.4"},
+				Conditions: discov1.EndpointConditions{Ready: &notReady},
+			},
+		},
+	}
+	s := collectServiceState([]*discov1.EndpointSlice{slice})
+	r.False(s.ready)
+}
+
+func TestCollectServiceState_NilReadyTreatedAsReady(t *testing.T) {
+	r := require.New(t)
+	slice := &discov1.EndpointSlice{
+		Endpoints: []discov1.Endpoint{
+			{Addresses: []string{"1.2.3.4"}},
+		},
+	}
+	s := collectServiceState([]*discov1.EndpointSlice{slice})
+	r.True(s.ready, "nil Ready should be treated as ready per K8s API spec")
+}
+
+func TestCollectServiceState_ExtractsPort(t *testing.T) {
+	r := require.New(t)
+	slice := &discov1.EndpointSlice{
+		Ports: []discov1.EndpointPort{
+			{Port: ptr.To(int32(8080))},
+		},
+		Endpoints: []discov1.Endpoint{
+			{Addresses: []string{"1.2.3.4"}},
+		},
+	}
+	s := collectServiceState([]*discov1.EndpointSlice{slice})
+	r.Len(s.candidates[""], 1)
+	r.Equal(int32(8080), s.candidates[""][0].port)
+}
+
+func TestCollectServiceState_DeduplicatesIPs(t *testing.T) {
+	r := require.New(t)
+	port := int32(8080)
+	// Two slices with overlapping IPs — the duplicate (ip, port) pair must appear only once.
+	s := collectServiceState([]*discov1.EndpointSlice{
+		{
+			Ports:     []discov1.EndpointPort{{Port: &port}},
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+		},
+		{
+			Ports:     []discov1.EndpointPort{{Port: &port}},
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4", "5.6.7.8"}}},
+		},
+	})
+	r.True(s.ready)
+	r.Len(s.candidates[""], 2)
+}
+
+func TestCollectServiceState_HeterogeneousPortsSamePortName(t *testing.T) {
+	r := require.New(t)
+	httpName := "http"
+	port8080 := int32(8080)
+	port9090 := int32(9090)
+
+	// Two slices carry the same portName "http" but different port numbers —
+	// the rolling-deploy scenario the reviewer identified.
+	s := collectServiceState([]*discov1.EndpointSlice{
+		{
+			Ports:     []discov1.EndpointPort{{Name: &httpName, Port: &port8080}},
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+		},
+		{
+			Ports:     []discov1.EndpointPort{{Name: &httpName, Port: &port9090}},
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"10.0.0.1"}}},
+		},
+	})
+
+	r.True(s.ready)
+	r.Len(s.candidates["http"], 2, "both (ip,port) pairs must be kept")
+
+	// Build a map from IP → port so we can verify no mismatching occurs.
+	ipToPort := make(map[string]int32)
+	for _, ep := range s.candidates["http"] {
+		ipToPort[ep.ip] = ep.port
+	}
+	r.Equal(int32(8080), ipToPort["1.2.3.4"])
+	r.Equal(int32(9090), ipToPort["10.0.0.1"])
+
+	// Verify PickReadyEndpoint never returns a mismatched pair.
+	c := NewReadyEndpointsCache(logr.Discard())
+	c.Update("testns/testsvc", []*discov1.EndpointSlice{
+		{
+			Ports:     []discov1.EndpointPort{{Name: &httpName, Port: &port8080}},
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+		},
+		{
+			Ports:     []discov1.EndpointPort{{Name: &httpName, Port: &port9090}},
+			Endpoints: []discov1.Endpoint{{Addresses: []string{"10.0.0.1"}}},
+		},
+	})
+	for range 100 {
+		ip, port, ok := c.PickReadyEndpoint("testns/testsvc", "http")
+		r.True(ok)
+		r.Equal(ipToPort[ip], port, "port must match the IP's slice, got ip=%s port=%d", ip, port)
+	}
+}
+
+// --- Update tests ---
+
+func TestUpdate_ClearsStateOnEmptySlices(t *testing.T) {
+	r := require.New(t)
+	c := NewReadyEndpointsCache(logr.Discard())
+	const key = "testns/testsvc"
+
+	c.Update(key, []*discov1.EndpointSlice{
+		newReadySlice("testns", "testsvc", "1.2.3.4"),
+	})
+
+	c.Update(key, nil) // clear
+
+	r.False(c.HasReadyEndpoints(key))
+	_, _, ok := c.PickReadyEndpoint(key, "")
+	r.False(ok)
+}
 
 func TestUpdateDeletesKeyWhenNoSlices(t *testing.T) {
 	r := require.New(t)
@@ -122,13 +392,13 @@ func TestUpdateDeletesKeyWhenNoSlices(t *testing.T) {
 	})
 
 	r.True(cache.HasReadyEndpoints(key))
-	_, ok := cache.ready.Load(key)
+	_, ok := cache.states.Load(key)
 	r.True(ok, "key should exist after update with slices")
 
 	cache.Update(key, nil)
 
 	r.False(cache.HasReadyEndpoints(key))
-	_, ok = cache.ready.Load(key)
+	_, ok = cache.states.Load(key)
 	r.False(ok, "key should be removed when service has no slices")
 }
 
@@ -137,96 +407,21 @@ func TestUpdateRetainsKeyForNonReadySlices(t *testing.T) {
 	cache := NewReadyEndpointsCache(logr.Discard())
 	const key = "testns/testsvc"
 
+	notReady := false
 	cache.Update(key, []*discov1.EndpointSlice{
-		newReadySlice("testns", "testsvc"),
+		{
+			Endpoints: []discov1.Endpoint{
+				{
+					Addresses:  []string{"1.2.3.4"},
+					Conditions: discov1.EndpointConditions{Ready: &notReady},
+				},
+			},
+		},
 	})
 
 	r.False(cache.HasReadyEndpoints(key))
-	_, ok := cache.ready.Load(key)
+	_, ok := cache.states.Load(key)
 	r.True(ok, "key should remain when slices exist but none are ready")
-}
-
-// --- hasAnyReadyEndpoint tests ---
-
-func TestHasAnyReadyEndpoint_ReadyWithAddress(t *testing.T) {
-	r := require.New(t)
-	slice := &discov1.EndpointSlice{
-		Endpoints: []discov1.Endpoint{
-			{Addresses: []string{"1.2.3.4"}},
-		},
-	}
-	r.True(hasAnyReadyEndpoint(slice))
-}
-
-func TestHasAnyReadyEndpoint_ExplicitReady(t *testing.T) {
-	r := require.New(t)
-	slice := &discov1.EndpointSlice{
-		Endpoints: []discov1.Endpoint{
-			{
-				Addresses:  []string{"1.2.3.4"},
-				Conditions: discov1.EndpointConditions{Ready: ptr.To(true)},
-			},
-		},
-	}
-	r.True(hasAnyReadyEndpoint(slice))
-}
-
-func TestHasAnyReadyEndpoint_NotReady(t *testing.T) {
-	r := require.New(t)
-	slice := &discov1.EndpointSlice{
-		Endpoints: []discov1.Endpoint{
-			{
-				Addresses:  []string{"1.2.3.4"},
-				Conditions: discov1.EndpointConditions{Ready: ptr.To(false)},
-			},
-		},
-	}
-	r.False(hasAnyReadyEndpoint(slice))
-}
-
-func TestHasAnyReadyEndpoint_NoAddresses(t *testing.T) {
-	r := require.New(t)
-	slice := &discov1.EndpointSlice{
-		Endpoints: []discov1.Endpoint{
-			{Addresses: []string{}},
-		},
-	}
-	r.False(hasAnyReadyEndpoint(slice))
-}
-
-func TestHasAnyReadyEndpoint_EmptySlice(t *testing.T) {
-	r := require.New(t)
-	slice := &discov1.EndpointSlice{}
-	r.False(hasAnyReadyEndpoint(slice))
-}
-
-func TestHasAnyReadyEndpoint_MixedEndpoints(t *testing.T) {
-	r := require.New(t)
-	slice := &discov1.EndpointSlice{
-		Endpoints: []discov1.Endpoint{
-			{
-				Addresses:  []string{"1.2.3.4"},
-				Conditions: discov1.EndpointConditions{Ready: ptr.To(false)},
-			},
-			{
-				Addresses: []string{"5.6.7.8"},
-			},
-		},
-	}
-	r.True(hasAnyReadyEndpoint(slice), "should find the second endpoint with nil Ready (defaults to ready)")
-}
-
-func TestHasAnyReadyEndpoint_NilReadyIsReady(t *testing.T) {
-	r := require.New(t)
-	slice := &discov1.EndpointSlice{
-		Endpoints: []discov1.Endpoint{
-			{
-				Addresses:  []string{"1.2.3.4"},
-				Conditions: discov1.EndpointConditions{},
-			},
-		},
-	}
-	r.True(hasAnyReadyEndpoint(slice), "nil Ready should be treated as ready per K8s API spec")
 }
 
 // --- endpointSliceFromDeleteObj tests ---
