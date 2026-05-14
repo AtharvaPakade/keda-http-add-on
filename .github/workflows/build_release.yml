@@ -3,17 +3,33 @@ name: Publish official image to GitHub Container Registry
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # Added for fork testing — allows manual trigger without pushing a real semver tag
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to use (without v prefix, e.g. 0.0.0-test)"
+        required: true
+        default: "0.0.0-test"
 
-permissions:
-  contents: read
+env:
+  KO_RELEASE_PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      packages: write
-      id-token: write # needed for signing images and release manifests with GitHub OIDC Token
+      contents: read    # checkout
+      packages: write   # push images to GHCR
+      id-token: write   # cosign keyless signing (OIDC token)
+    outputs:
+      version:            ${{ steps.get_version.outputs.VERSION }}
+      operator-image:     ${{ steps.publish-operator.outputs.image }}
+      operator-digest:    ${{ steps.publish-operator.outputs.digest }}
+      interceptor-image:  ${{ steps.publish-interceptor.outputs.image }}
+      interceptor-digest: ${{ steps.publish-interceptor.outputs.digest }}
+      scaler-image:       ${{ steps.publish-scaler.outputs.image }}
+      scaler-digest:      ${{ steps.publish-scaler.outputs.digest }}
+      manifests-subjects: ${{ steps.manifests-hash.outputs.subjects }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -25,22 +41,74 @@ jobs:
       - name: Get the version
         id: get_version
         run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log resolved version
+        run: echo "Building version ${{ steps.get_version.outputs.VERSION }} triggered by ${{ github.event_name }}"
 
       - name: Login to GHCR
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          # Username used to log in to a Docker registry. If not set then no login will occur
           username: ${{ github.repository_owner }}
-          # Password or personal access token used to log in to a Docker registry. If not set then no login will occur
           password: ${{ secrets.GITHUB_TOKEN }}
-          # Server address of Docker registry. If not set then will default to Docker Hub
           registry: ghcr.io
 
-      - name: Publish on GitHub Container Registry
-        run: make publish
+      # Publish each image in a separate step so its digest can be captured
+      # individually — required as input for the provenance jobs below.
+      # ko build --bare outputs the full image ref (image@sha256:...) to stdout.
+      # KO_DOCKER_REPO is set per-step using bash lowercasing so forks work
+      # correctly (github.repository_owner may have mixed case, GHCR requires lower).
+      - name: Publish operator image
+        id: publish-operator
         env:
           VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          export KO_DOCKER_REPO="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/http-add-on-operator"
+          image_and_digest=$(ko build --bare \
+            --platform="${KO_RELEASE_PLATFORMS}" \
+            --tags="${VERSION},${{ github.sha }}" \
+            ./operator)
+          echo "image=${image_and_digest%%@*}" >> "$GITHUB_OUTPUT"
+          echo "digest=${image_and_digest##*@}" >> "$GITHUB_OUTPUT"
+          echo "Operator published: ${image_and_digest}"
+
+      - name: Publish interceptor image
+        id: publish-interceptor
+        env:
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          export KO_DOCKER_REPO="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/http-add-on-interceptor"
+          image_and_digest=$(ko build --bare \
+            --platform="${KO_RELEASE_PLATFORMS}" \
+            --tags="${VERSION},${{ github.sha }}" \
+            ./interceptor)
+          echo "image=${image_and_digest%%@*}" >> "$GITHUB_OUTPUT"
+          echo "digest=${image_and_digest##*@}" >> "$GITHUB_OUTPUT"
+          echo "Interceptor published: ${image_and_digest}"
+
+      - name: Publish scaler image
+        id: publish-scaler
+        env:
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          export KO_DOCKER_REPO="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/http-add-on-scaler"
+          image_and_digest=$(ko build --bare \
+            --platform="${KO_RELEASE_PLATFORMS}" \
+            --tags="${VERSION},${{ github.sha }}" \
+            ./scaler)
+          echo "image=${image_and_digest%%@*}" >> "$GITHUB_OUTPUT"
+          echo "digest=${image_and_digest##*@}" >> "$GITHUB_OUTPUT"
+          echo "Scaler published: ${image_and_digest}"
+
+      - name: Log published image digests
+        run: |
+          echo "operator:    ${{ steps.publish-operator.outputs.image }}@${{ steps.publish-operator.outputs.digest }}"
+          echo "interceptor: ${{ steps.publish-interceptor.outputs.image }}@${{ steps.publish-interceptor.outputs.digest }}"
+          echo "scaler:      ${{ steps.publish-scaler.outputs.image }}@${{ steps.publish-scaler.outputs.digest }}"
 
       - name: Release Deployment YAML file
         run: make release
@@ -51,32 +119,151 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - name: Check Cosign install!
+      - name: Check Cosign install
         run: cosign version
 
       - name: Sign KEDA images published on GitHub Container Registry
-        # This step uses the identity token to provision an ephemeral certificate
+        # Uses the GitHub OIDC identity token to provision an ephemeral certificate
         # against the sigstore community Fulcio instance.
-        run: make sign-images
         env:
           VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          export IMAGE_OPERATOR="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/http-add-on-operator"
+          export IMAGE_INTERCEPTOR="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/http-add-on-interceptor"
+          export IMAGE_SCALER="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/http-add-on-scaler"
+          make sign-images
 
+      # Blob signing must happen in the same job that generates the files.
+      # Signing in a separate job would risk signing tampered files since the
+      # artifact store is not a trusted environment.
       - name: Sign release manifests
         run: |
-          for f in "keda-add-ons-http-${VERSION}.yaml" "keda-add-ons-http-${VERSION}-crds.yaml"; do
+          for f in "keda-add-ons-http-${{ steps.get_version.outputs.VERSION }}.yaml" \
+                   "keda-add-ons-http-${{ steps.get_version.outputs.VERSION }}-crds.yaml"; do
             cosign sign-blob --yes "$f" --bundle "${f}.bundle.json"
           done
-        env:
-          VERSION: ${{ steps.get_version.outputs.VERSION }}
+
+      # Compute SHA256 of both manifest files and encode as base64 JSON subjects
+      # for the generic SLSA generator (generator_generic_slsa3.yml expects this format).
+      # Must happen after signing so the hash covers the final file content.
+      - name: Compute manifest subjects for provenance
+        id: manifests-hash
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          FULL_SHA=$(sha256sum "keda-add-ons-http-${VERSION}.yaml" | cut -d ' ' -f1)
+          CRDS_SHA=$(sha256sum "keda-add-ons-http-${VERSION}-crds.yaml" | cut -d ' ' -f1)
+          SUBJECTS=$(echo "[
+            {\"name\":\"keda-add-ons-http-${VERSION}.yaml\",\"digest\":{\"sha256\":\"${FULL_SHA}\"}},
+            {\"name\":\"keda-add-ons-http-${VERSION}-crds.yaml\",\"digest\":{\"sha256\":\"${CRDS_SHA}\"}}
+          ]" | base64 -w0)
+          echo "subjects=${SUBJECTS}" >> "$GITHUB_OUTPUT"
+          echo "Manifest subjects computed:"
+          echo "  keda-add-ons-http-${VERSION}.yaml → sha256:${FULL_SHA}"
+          echo "  keda-add-ons-http-${VERSION}-crds.yaml → sha256:${CRDS_SHA}"
+
+      # Upload manifest files and cosign bundles as workflow artifacts so the
+      # release job (which runs after all provenance jobs) can access them.
+      - name: Upload manifest artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: manifests-${{ steps.get_version.outputs.VERSION }}
+          path: |
+            keda-add-ons-http-${{ steps.get_version.outputs.VERSION }}.yaml
+            keda-add-ons-http-${{ steps.get_version.outputs.VERSION }}.yaml.bundle.json
+            keda-add-ons-http-${{ steps.get_version.outputs.VERSION }}-crds.yaml
+            keda-add-ons-http-${{ steps.get_version.outputs.VERSION }}-crds.yaml.bundle.json
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # SLSA Level 3 provenance jobs.
+  # Each runs as a separate job (separate VM = isolated environment) which is
+  # the L3 control plane separation requirement — the signing key is never
+  # accessible to the build job above.
+  #
+  # The generator's OIDC identity signs the provenance, not this repo's workflow.
+  # That is what makes the provenance non-falsifiable (L3).
+  #
+  # All three image provenance jobs are explicit (no matrix) because GitHub
+  # Actions does not support matrix strategy on reusable workflow calls (uses:).
+  # ---------------------------------------------------------------------------
+
+  provenance-operator:
+    needs: [build]
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.build.outputs.operator-image }}
+      digest: ${{ needs.build.outputs.operator-digest }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  provenance-interceptor:
+    needs: [build]
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.build.outputs.interceptor-image }}
+      digest: ${{ needs.build.outputs.interceptor-digest }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  provenance-scaler:
+    needs: [build]
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.build.outputs.scaler-image }}
+      digest: ${{ needs.build.outputs.scaler-digest }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  # Generates a single provenance document covering both manifest YAML files.
+  # The generic generator supports multiple subjects via base64-encoded JSON.
+  # upload-assets: true attaches the provenance file to the GitHub release.
+  provenance-manifests:
+    needs: [build]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.build.outputs.manifests-subjects }}
+      upload-assets: true
+
+  # ---------------------------------------------------------------------------
+  # Release job — runs only after all provenance attestations are attached.
+  # Guarantees consumers always find provenance alongside release assets.
+  # Skipped on workflow_dispatch since no GitHub release exists to upload to.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [build, provenance-operator, provenance-interceptor, provenance-scaler, provenance-manifests]
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release upload
+    steps:
+      - name: Download manifest artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: manifests-${{ needs.build.outputs.version }}
 
       - name: Upload release assets
         run: |
           gh release upload "${GITHUB_REF_NAME}" \
-            "keda-add-ons-http-${VERSION}.yaml" \
-            "keda-add-ons-http-${VERSION}.yaml.bundle.json" \
-            "keda-add-ons-http-${VERSION}-crds.yaml" \
-            "keda-add-ons-http-${VERSION}-crds.yaml.bundle.json" \
+            "keda-add-ons-http-${{ needs.build.outputs.version }}.yaml" \
+            "keda-add-ons-http-${{ needs.build.outputs.version }}.yaml.bundle.json" \
+            "keda-add-ons-http-${{ needs.build.outputs.version }}-crds.yaml" \
+            "keda-add-ons-http-${{ needs.build.outputs.version }}-crds.yaml.bundle.json" \
             --clobber
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.get_version.outputs.VERSION }}
