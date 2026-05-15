@@ -111,9 +111,35 @@ jobs:
           echo "scaler:      ${{ steps.publish-scaler.outputs.image }}@${{ steps.publish-scaler.outputs.digest }}"
 
       - name: Release Deployment YAML file
-        run: make release
         env:
           VERSION: ${{ steps.get_version.outputs.VERSION }}
+          OPERATOR_REF:     ${{ steps.publish-operator.outputs.image }}@${{ steps.publish-operator.outputs.digest }}
+          INTERCEPTOR_REF:  ${{ steps.publish-interceptor.outputs.image }}@${{ steps.publish-interceptor.outputs.digest }}
+          SCALER_REF:       ${{ steps.publish-scaler.outputs.image }}@${{ steps.publish-scaler.outputs.digest }}
+        run: |
+          # CRDs — no images, written as-is
+          kustomize build config/crd > "keda-add-ons-http-${VERSION}.yaml"
+          echo '---' >> "keda-add-ons-http-${VERSION}.yaml"
+
+          # Operator — substitute ko:// placeholder with the digest published above
+          kustomize build config/operator \
+            | sed "s|ko://github.com/kedacore/http-add-on/operator|${OPERATOR_REF}|g" \
+            >> "keda-add-ons-http-${VERSION}.yaml"
+          echo '---' >> "keda-add-ons-http-${VERSION}.yaml"
+
+          # Interceptor
+          kustomize build config/interceptor \
+            | sed "s|ko://github.com/kedacore/http-add-on/interceptor|${INTERCEPTOR_REF}|g" \
+            >> "keda-add-ons-http-${VERSION}.yaml"
+          echo '---' >> "keda-add-ons-http-${VERSION}.yaml"
+
+          # Scaler
+          kustomize build config/scaler \
+            | sed "s|ko://github.com/kedacore/http-add-on/scaler|${SCALER_REF}|g" \
+            >> "keda-add-ons-http-${VERSION}.yaml"
+
+          # Separate CRDs-only file
+          kustomize build config/crd > "keda-add-ons-http-${VERSION}-crds.yaml"
 
       # https://github.com/sigstore/cosign-installer
       - name: Install Cosign
