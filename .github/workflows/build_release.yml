@@ -228,6 +228,7 @@ jobs:
     with:
       image: ${{ needs.build.outputs.operator-image }}
       digest: ${{ needs.build.outputs.operator-digest }}
+      registry-username: ${{ github.repository_owner }}
     secrets:
       registry-password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -241,6 +242,7 @@ jobs:
     with:
       image: ${{ needs.build.outputs.interceptor-image }}
       digest: ${{ needs.build.outputs.interceptor-digest }}
+      registry-username: ${{ github.repository_owner }}
     secrets:
       registry-password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -254,6 +256,7 @@ jobs:
     with:
       image: ${{ needs.build.outputs.scaler-image }}
       digest: ${{ needs.build.outputs.scaler-digest }}
+      registry-username: ${{ github.repository_owner }}
     secrets:
       registry-password: ${{ secrets.GITHUB_TOKEN }}
 
