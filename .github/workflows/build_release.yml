@@ -260,19 +260,19 @@ jobs:
     secrets:
       registry-password: ${{ secrets.GITHUB_TOKEN }}
 
-  # Generates a single provenance document covering both manifest YAML files.
-  # The generic generator supports multiple subjects via base64-encoded JSON.
-  # upload-assets: true attaches the provenance file to the GitHub release.
-  provenance-manifests:
-    needs: [build]
-    permissions:
-      actions: read
-      id-token: write
-      contents: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
-    with:
-      base64-subjects: ${{ needs.build.outputs.manifests-subjects }}
-      upload-assets: true
+  # # Generates a single provenance document covering both manifest YAML files.
+  # # The generic generator supports multiple subjects via base64-encoded JSON.
+  # # upload-assets: true attaches the provenance file to the GitHub release.
+  # provenance-manifests:
+  #   needs: [build]
+  #   permissions:
+  #     actions: read
+  #     id-token: write
+  #     contents: write
+  #   uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+  #   with:
+  #     base64-subjects: ${{ needs.build.outputs.manifests-subjects }}
+  #     upload-assets: true
 
   # ---------------------------------------------------------------------------
   # Release job — runs only after all provenance attestations are attached.
@@ -280,7 +280,7 @@ jobs:
   # Skipped on workflow_dispatch since no GitHub release exists to upload to.
   # ---------------------------------------------------------------------------
   release:
-    needs: [build, provenance-operator, provenance-interceptor, provenance-scaler, provenance-manifests]
+    needs: [build, provenance-operator, provenance-interceptor, provenance-scaler, ]
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
