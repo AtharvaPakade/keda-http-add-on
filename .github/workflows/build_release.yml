@@ -151,8 +151,13 @@ jobs:
       - name: Sign KEDA images published on GitHub Container Registry
         # Uses the GitHub OIDC identity token to provision an ephemeral certificate
         # against the sigstore community Fulcio instance.
+        # Digests are passed explicitly so cosign signs the immutable image@sha256
+        # reference — required for SLSA Level 3 (tag-based signing is mutable).
         env:
           VERSION: ${{ steps.get_version.outputs.VERSION }}
+          IMAGE_OPERATOR_DIGEST:     ${{ steps.publish-operator.outputs.digest }}
+          IMAGE_INTERCEPTOR_DIGEST:  ${{ steps.publish-interceptor.outputs.digest }}
+          IMAGE_SCALER_DIGEST:       ${{ steps.publish-scaler.outputs.digest }}
         run: |
           export IMAGE_OPERATOR="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/http-add-on-operator"
           export IMAGE_INTERCEPTOR="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/http-add-on-interceptor"

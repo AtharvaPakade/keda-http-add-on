@@ -25,6 +25,18 @@ IMAGE_OPERATOR_SHA_TAG     ?= $(IMAGE_OPERATOR):$(GIT_COMMIT_SHORT)
 IMAGE_INTERCEPTOR_SHA_TAG  ?= $(IMAGE_INTERCEPTOR):$(GIT_COMMIT_SHORT)
 IMAGE_SCALER_SHA_TAG       ?= $(IMAGE_SCALER):$(GIT_COMMIT_SHORT)
 
+# Immutable digest references used for cosign signing (required for SLSA L3).
+# Set by the CI workflow after ko build captures the digest from the registry.
+# If unset (e.g. local dev), falls back to the versioned tag — mutable but
+# still functional for manual signing outside the SLSA pipeline.
+IMAGE_OPERATOR_DIGEST     ?=
+IMAGE_INTERCEPTOR_DIGEST  ?=
+IMAGE_SCALER_DIGEST       ?=
+
+IMAGE_OPERATOR_REF     := $(if $(IMAGE_OPERATOR_DIGEST),$(IMAGE_OPERATOR)@$(IMAGE_OPERATOR_DIGEST),$(IMAGE_OPERATOR_VERSIONED_TAG))
+IMAGE_INTERCEPTOR_REF  := $(if $(IMAGE_INTERCEPTOR_DIGEST),$(IMAGE_INTERCEPTOR)@$(IMAGE_INTERCEPTOR_DIGEST),$(IMAGE_INTERCEPTOR_VERSIONED_TAG))
+IMAGE_SCALER_REF       := $(if $(IMAGE_SCALER_DIGEST),$(IMAGE_SCALER)@$(IMAGE_SCALER_DIGEST),$(IMAGE_SCALER_VERSIONED_TAG))
+
 KO_RELEASE_PLATFORMS ?= linux/amd64,linux/arm64
 
 # renovate: datasource=helm depName=cert-manager registryUrl=https://charts.jetstack.io
@@ -271,9 +283,6 @@ release: manifests ## Produce new KEDA Http Add-on release in keda-add-ons-http-
 	kustomize build config/crd > keda-add-ons-http-$(VERSION)-crds.yaml
 
 sign-images: ## Sign KEDA images published on GitHub Container Registry
-	cosign sign $(COSIGN_FLAGS) $(IMAGE_OPERATOR_VERSIONED_TAG)
-	cosign sign $(COSIGN_FLAGS) $(IMAGE_OPERATOR_SHA_TAG)
-	cosign sign $(COSIGN_FLAGS) $(IMAGE_INTERCEPTOR_VERSIONED_TAG)
-	cosign sign $(COSIGN_FLAGS) $(IMAGE_INTERCEPTOR_SHA_TAG)
-	cosign sign $(COSIGN_FLAGS) $(IMAGE_SCALER_VERSIONED_TAG)
-	cosign sign $(COSIGN_FLAGS) $(IMAGE_SCALER_SHA_TAG)
+	cosign sign $(COSIGN_FLAGS) $(IMAGE_OPERATOR_REF)
+	cosign sign $(COSIGN_FLAGS) $(IMAGE_INTERCEPTOR_REF)
+	cosign sign $(COSIGN_FLAGS) $(IMAGE_SCALER_REF)
