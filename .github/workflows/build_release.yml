@@ -3,6 +3,13 @@ name: Publish official image to GitHub Container Registry
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # Added for fork testing — allows manual trigger without pushing a real semver tag
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to use (without v prefix, e.g. 0.0.0-test)"
+        required: true
+        default: "0.0.0-test"
 
 permissions:
   contents: read
@@ -18,7 +25,12 @@ jobs:
     steps:
       - name: Get the version
         id: get_version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Get lowercase image repo
         id: get_repo
@@ -181,6 +193,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     needs: [get-version, manifests, provenance-manifests, provenance-operator, provenance-interceptor, provenance-scaler]
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write   # gh release upload
